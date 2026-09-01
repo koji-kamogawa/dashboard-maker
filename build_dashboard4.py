@@ -535,17 +535,21 @@ def chart_top_content(content_df, latest_dl_date, top_n=10):
     return fig_to_base64(fig)
 
 
-def chart_top_content_range(content_df, start_date, end_date, top_n=10):
-    """指定期間内に含まれる週次スナップショット（取得日）を対象に、コンテンツごとの
-    『過去7日間の閲覧数』を合算してランキングする（参考値：週次スナップショットの重なりにより
-    厳密な期間合計ではないが、期間内での相対的な人気度の目安として利用できる）。"""
-    sub = content_df[(content_df["取得日"] >= start_date) & (content_df["取得日"] <= end_date)]
+def chart_top_content_range(content_df, start_date, end_date, top_n=10, content_type=None):
+    """指定期間内の週次スナップショットを合算して人気コンテンツを描画する。
+
+    content_type が None の場合は全種類、指定時は「種類」列を完全一致で絞り込む。
+    """
+    sub = content_df[(content_df["取得日"] >= start_date) & (content_df["取得日"] <= end_date)].copy()
+    if content_type:
+        sub = sub[sub["種類"].fillna("").astype(str).str.strip() == content_type]
     if sub.empty:
         return None
     agg = sub.groupby("コンテンツ", as_index=False)["PV7"].sum().sort_values("PV7", ascending=False).head(top_n)
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.barh(agg["コンテンツ"][::-1], agg["PV7"][::-1], color="#4472C4")
-    ax.set_title(f"人気コンテンツ TOP{top_n}（{start_date} 〜 {end_date}の週次スナップショット合計・参考値）")
+    type_label = content_type if content_type else "すべて"
+    ax.set_title(f"人気コンテンツ TOP{top_n}［{type_label}］（{start_date} 〜 {end_date}の週次スナップショット合計・参考値）")
     ax.set_xlabel("閲覧数（週次スナップショットの合算）")
     return fig_to_base64(fig)
 
@@ -1027,9 +1031,15 @@ CUSTOM_PERIOD_CHART_JS = """
   /* ------------------------------------------------------------------------
    * 人気コンテンツ TOP10（期間内の週次スナップショットを合算・参考値）
    * ----------------------------------------------------------------------*/
-  function renderContentChart(container, contentRows, startDate, endDate, topN) {
+  function renderContentChart(container, contentRows, startDate, endDate, topN, contentType) {
     container.innerHTML = "";
     topN = topN || 10;
+    contentType = contentType || "all";
+    if (contentType !== "all") {
+      contentRows = contentRows.filter(function (r) {
+        return String(r.type || "").trim() === contentType;
+      });
+    }
     if (contentRows.length === 0) {
       clearAndMsg(container, "データがありませんでした。");
       return;
@@ -1041,7 +1051,8 @@ CUSTOM_PERIOD_CHART_JS = """
     });
     var entries = Object.keys(agg).map(function (k) { return [k, agg[k]]; });
     entries.sort(function (a, b) { return b[1] - a[1]; });
-    entries = entries.slice(0, topN).reverse(); // 下から積み上げ表示のため逆順
+    // 上位1位から上位10位の順に、グラフの上から表示する。
+    entries = entries.slice(0, topN);
 
     var W = 900, rowH = 30, MT = 40, MB = 40, ML = 260, MR = 40;
     var H = MT + MB + entries.length * rowH;
@@ -1076,7 +1087,8 @@ CUSTOM_PERIOD_CHART_JS = """
     });
 
     var title = svgEl("text", { x: W / 2, y: 18, "text-anchor": "middle", "font-size": 13, fill: "#333" });
-    title.textContent = "人気コンテンツ TOP" + topN + "（" + startDate + " 〜 " + endDate + " の週次スナップショット合計・参考値）";
+    var typeLabel = contentType === "all" ? "すべて" : contentType;
+    title.textContent = "人気コンテンツ TOP" + topN + "［" + typeLabel + "］（" + startDate + " 〜 " + endDate + " の週次スナップショット合計・参考値）";
     svg.appendChild(title);
 
     var xlabel = svgEl("text", { x: ML + innerW / 2, y: H - 8, "text-anchor": "middle", "font-size": 11, fill: "#555" });
@@ -1148,7 +1160,9 @@ CUSTOM_PERIOD_CHART_JS = """
     renderTrendChart(document.getElementById("custom-chart-trend"), trafficRows);
     renderCumulativeChart(document.getElementById("custom-chart-cumulative"), trafficRows);
     renderDeviceChart(document.getElementById("custom-chart-device"), deviceRows);
-    renderContentChart(document.getElementById("custom-chart-content"), contentRows, startStr, endStr, 10);
+    var selector = document.getElementById("custom-content-type");
+    var contentType = selector ? selector.value : "all";
+    renderContentChart(document.getElementById("custom-chart-content"), contentRows, startStr, endStr, 10, contentType);
   }
 
   // グローバルに公開（onclick 属性から呼び出すため）
@@ -1179,20 +1193,46 @@ def build_html(data, out_path=None):
 
         if not t_sub.empty:
             start_date, end_date = t_sub["日付"].min(), t_sub["日付"].max()
-            img_content = chart_top_content_range(content_df, start_date, end_date) if not content_df.empty else None
+            content_images = {
+                "all": chart_top_content_range(content_df, start_date, end_date),
+                "Site Page": chart_top_content_range(content_df, start_date, end_date, content_type="Site Page"),
+                "News Post": chart_top_content_range(content_df, start_date, end_date, content_type="News Post"),
+                "Document": chart_top_content_range(content_df, start_date, end_date, content_type="Document"),
+            } if not content_df.empty else {}
         else:
-            img_content = None
+            content_images = {}
 
         def img_block(title, b64):
             if b64 is None:
                 return f"<h2>{title}</h2><p class='note'>データがありませんでした。</p>"
             return f"<h2>{title}</h2><img src='data:image/png;base64,{b64}' style='max-width:100%;'>"
 
+        panel_key = str(days if days else "all")
+        content_type_buttons = "".join(
+            f'<button class="content-type-btn {"active" if key == "all" else ""}" '
+            f'onclick="showContentType(\'{panel_key}\', \'{key}\', this)">{label}</button>'
+            for key, label in [("all", "すべて"), ("Site Page", "Site Page"),
+                               ("News Post", "News Post"), ("Document", "Document")]
+        )
+        content_type_panels = "".join(
+            f'<div class="content-type-panel content-group-{panel_key}" data-content-type="{key}" '
+            f'style="display:{"block" if key == "all" else "none"};">'
+            + (f'<img src="data:image/png;base64,{content_images[key]}" style="max-width:100%;">'
+               if content_images.get(key) else '<p class="note">該当するデータがありませんでした。</p>')
+            + '</div>'
+            for key in ["all", "Site Page", "News Post", "Document"]
+        )
+        content_block = (
+            '<h2>人気コンテンツ TOP10</h2>'
+            f'<div class="content-type-bar" data-group="{panel_key}">{content_type_buttons}</div>'
+            f'{content_type_panels}'
+        )
+
         inner = (
             img_block("日次トラフィック推移", img_trend)
             + img_block("累積PV", img_cum_pv)
             + img_block("デバイス別 閲覧数推移", img_device)
-            + img_block("人気コンテンツ TOP10", img_content)
+            + content_block
         )
         html_id = f"period-{days if days else 'all'}"
         period_panels.append((label, html_id, inner))
@@ -1287,6 +1327,16 @@ def build_html(data, out_path=None):
       <h2>デバイス別 閲覧数推移</h2>
       <div id="custom-chart-device"></div>
       <h2>人気コンテンツ TOP10</h2>
+      <div class="content-type-bar">
+        <label>種類：
+          <select id="custom-content-type" onchange="applyCustomPeriod()">
+            <option value="all">すべて</option>
+            <option value="Site Page">Site Page</option>
+            <option value="News Post">News Post</option>
+            <option value="Document">Document</option>
+          </select>
+        </label>
+      </div>
       <div id="custom-chart-content"></div>
     </div>
     """
@@ -1333,6 +1383,14 @@ def build_html(data, out_path=None):
   .custom-summary-tbl th:first-child, .custom-summary-tbl td:first-child {{ text-align: left; }}
   .custom-summary-tbl th {{ background: #d9e2f3; }}
   .chart-legend {{ font-size:0.8em; }}
+  .content-type-bar {{ margin: 12px 0 16px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
+  .content-type-btn {{
+      font-family:inherit; font-size:0.9em; padding:6px 16px; border:1px solid #4472C4;
+      background:#fff; color:#305496; border-radius:18px; cursor:pointer;
+  }}
+  .content-type-btn:hover {{ background:#d9e2f3; }}
+  .content-type-btn.active {{ background:#4472C4; color:#fff; }}
+  #custom-content-type {{ font-family:inherit; font-size:0.95em; padding:5px 10px; border:1px solid #bbb; border-radius:4px; }}
 </style>
 </head>
 <body>
@@ -1356,6 +1414,17 @@ def build_html(data, out_path=None):
 <script id="dashboard-raw-data" type="application/json">{raw_data_json}</script>
 
 <script>
+function showContentType(group, contentType, clickedButton) {{
+    document.querySelectorAll('.content-group-' + group).forEach(function(el) {{
+        el.style.display = (el.getAttribute('data-content-type') === contentType) ? 'block' : 'none';
+    }});
+    var bar = clickedButton.closest('.content-type-bar');
+    if (bar) {{
+        bar.querySelectorAll('.content-type-btn').forEach(function(btn) {{ btn.classList.remove('active'); }});
+    }}
+    clickedButton.classList.add('active');
+}}
+
 function showPeriod(id) {{
     document.querySelectorAll('.period-panel').forEach(function(el) {{
         el.style.display = (el.id === id) ? 'block' : 'none';
