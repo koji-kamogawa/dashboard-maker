@@ -61,6 +61,21 @@ import matplotlib.font_manager as fm
 # 日本語フォントの自動選択（無ければ警告を出して既定フォントで続行）
 # ----------------------------------------------------------------------------
 def setup_japanese_font():
+    """日本語フォントを探して matplotlib に設定する。
+
+    手順:
+      1) まずフォント名で検索する（ローカルWindows/macOS環境など、
+         OSにインストール済みのフォントをそのまま使えるケース向け）。
+      2) 名前で見つからない場合、既知のファイルパスを直接
+         fm.fontManager.addfont() で読み込む。
+         Streamlit Cloud（Debian/Ubuntu）で apt 経由インストールされる
+         fonts-noto-cjk は「可変フォント(Variable Font)」形式の .ttc であり、
+         matplotlib が使う FreeType がこれを正しく解析できず
+         "RuntimeError: broken table" 等で読み込みに失敗する既知の問題があるため、
+         静的フォントである IPAフォント／IPAexフォント／Takaoフォントを優先的に
+         フォールバック候補として試す。
+      3) それでも見つからなければ警告を出し、日本語グリフは文字化け（□）のまま続行する。
+    """
     candidates = [
         "Noto Sans CJK JP", "Noto Sans JP", "IPAexGothic", "IPAGothic",
         "Yu Gothic", "Meiryo", "Hiragino Sans", "MS Gothic", "TakaoPGothic",
@@ -70,8 +85,33 @@ def setup_japanese_font():
         if name in available:
             plt.rcParams["font.family"] = name
             return name
+
+    # --- フォールバック: 既知のパスにある「静的」日本語フォントを直接読み込む ---
+    # 可変フォント(Noto Sans CJK の .ttc)は matplotlib で読み込めないことがあるため、
+    # ここでは静的フォント（IPA/IPAex/Takao/VLGothic）のパスのみを候補にする。
+    fallback_paths = [
+        "/usr/share/fonts/opentype/ipaexfont-gothic/ipaexg.ttf",   # fonts-ipaexfont-gothic
+        "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",       # fonts-ipafont-gothic
+        "/usr/share/fonts/truetype/takao-gothic/TakaoPGothic.ttf", # fonts-takao
+        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",     # 一部ディストリ
+        "/usr/share/fonts/truetype/vlgothic/VL-PGothic-Regular.ttf",  # fonts-vlgothic
+    ]
+    for path in fallback_paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            fm.fontManager.addfont(path)
+            prop = fm.FontProperties(fname=path)
+            font_name = prop.get_name()
+            plt.rcParams["font.family"] = font_name
+            return font_name
+        except Exception as e:
+            print(f"[警告] フォント読み込みに失敗しました（{path}）: {e}", file=sys.stderr)
+            continue
+
     print("[警告] 日本語フォントが見つかりませんでした。グラフの日本語が文字化けする場合は "
-          "Noto Sans CJK JP などをインストールしてください。", file=sys.stderr)
+          "packages.txt に fonts-ipafont-gothic（または fonts-ipaexfont-gothic）を追加してください。",
+          file=sys.stderr)
     return None
 
 setup_japanese_font()
