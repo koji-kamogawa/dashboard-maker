@@ -26,7 +26,7 @@ from io import BytesIO
 
 import streamlit as st
 
-from build_dashboard3 import load_all_from_sources, build_html_string
+from build_dashboard4 import load_all_from_sources, build_html_string
 
 
 st.set_page_config(
