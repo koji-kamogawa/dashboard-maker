@@ -103,6 +103,21 @@ def parse_download_date(ws, fallback_path):
     return datetime.date.fromtimestamp(ts)
 
 
+def parse_download_date_or_default(ws, fallback_date):
+    """シート冒頭の『レポートのダウンロード日: 27日-7月,2026年』を日付に変換。
+    見つからない場合は fallback_date（呼び出し側から渡された日付）をそのまま使う。
+    アップロードされた file-like オブジェクトにはファイル更新日時が無いため、
+    parse_download_date() とは別に用意した派生版。"""
+    for r in range(1, 6):
+        v = ws.cell(row=r, column=1).value
+        if isinstance(v, str) and "ダウンロード日" in v:
+            m = re.search(r"(\d+)日-(\d+)月,(\d+)年", v)
+            if m:
+                d, mo, y = map(int, m.groups())
+                return datetime.date(y, mo, d)
+    return fallback_date
+
+
 def extract_daily_sheet(ws, value_cols):
     """『日付』ヘッダーを持つシート（全体的なトラフィック / デバイス別の使用状況）から
     日付と数値列を抽出する。value_cols は見出し名のリスト。"""
@@ -255,6 +270,113 @@ def load_all(folder):
         "latest_summary": latest_summary,
         "n_files": len(files),
         "gaps": gaps,
+        "file_warnings": [],
+    }
+
+
+# ----------------------------------------------------------------------------
+# Streamlit（アップロード）版: フォルダではなく file-like オブジェクトのlistから読み込む
+# ----------------------------------------------------------------------------
+def load_all_from_sources(sources):
+    """sources: [(ファイル名, file-likeオブジェクト, フォールバック日付), ...] の形式のlist。
+    dashboard_maker.py（Streamlit UI）から、st.file_uploader でアップロードされた
+    複数の xlsx をこの形式に変換して渡すことを想定している。
+    load_all(folder) とほぼ同じロジックだが、
+      - openpyxl.load_workbook にファイルパスではなく file-like を渡す
+      - 「ダウンロード日」が見つからない場合のフォールバックに os.path.getmtime ではなく
+        呼び出し側が渡した日付（today など）を使う
+      - 個々のファイルの読み込み失敗やシート欠如を例外で落とさず file_warnings に集約する
+    点が異なる。"""
+    traffic_rows, device_rows, content_rows, hourly_rows = [], [], [], []
+    summaries = {}
+    latest_dl_date, latest_hourly = None, None
+    file_warnings = []
+
+    for name, file_like, fallback_date in sources:
+        try:
+            wb = openpyxl.load_workbook(file_like, data_only=True)
+        except Exception as e:
+            file_warnings.append((name, f"読み込みに失敗しました（xlsx形式を確認してください）: {e}"))
+            continue
+
+        dl_date = None
+        found_any_sheet = False
+
+        if "全体的なトラフィック" in wb.sheetnames:
+            found_any_sheet = True
+            ws = wb["全体的なトラフィック"]
+            dl_date = parse_download_date_or_default(ws, fallback_date)
+            for d, uu, pv in extract_daily_sheet(ws, ["UU", "PV"]):
+                traffic_rows.append((dl_date, d, uu, pv))
+            summaries[dl_date] = extract_summary_block(ws)
+
+        if "デバイス別の使用状況" in wb.sheetnames:
+            found_any_sheet = True
+            ws = wb["デバイス別の使用状況"]
+            if dl_date is None:
+                dl_date = parse_download_date_or_default(ws, fallback_date)
+            for row in extract_daily_sheet(ws, ["desktop", "mobileapp", "mobileweb", "tablet", "other"]):
+                device_rows.append((dl_date, *row))
+
+        if "人気のあるコンテンツ" in wb.sheetnames:
+            found_any_sheet = True
+            ws = wb["人気のあるコンテンツ"]
+            if dl_date is None:
+                dl_date = parse_download_date_or_default(ws, fallback_date)
+            for c_name, typ, uu7, pv7 in extract_content_sheet(ws):
+                content_rows.append((dl_date, c_name, typ, uu7, pv7))
+
+        if "時間別の使用状況" in wb.sheetnames:
+            found_any_sheet = True
+            ws = wb["時間別の使用状況"]
+            if dl_date is None:
+                dl_date = parse_download_date_or_default(ws, fallback_date)
+            rows = extract_hourly_sheet(ws)
+            if latest_dl_date is None or (dl_date and dl_date >= latest_dl_date):
+                latest_hourly = rows
+
+        if not found_any_sheet:
+            file_warnings.append(
+                (name, "想定するシート（全体的なトラフィック 等）が見つかりませんでした。")
+            )
+
+        if dl_date is not None and (latest_dl_date is None or dl_date >= latest_dl_date):
+            latest_dl_date = dl_date
+
+    traffic_df = pd.DataFrame(traffic_rows, columns=["取得日", "日付", "UU", "PV"])
+    device_df = pd.DataFrame(device_rows, columns=["取得日", "日付", "desktop", "mobileapp", "mobileweb", "tablet", "other"])
+    content_df = pd.DataFrame(content_rows, columns=["取得日", "コンテンツ", "種類", "UU7", "PV7"])
+    hourly_df = pd.DataFrame(latest_hourly or [], columns=["時間帯", "平均UU_7日"])
+
+    def dedup_by_date(df):
+        if df.empty:
+            return df
+        df = df.sort_values(["日付", "取得日"])
+        return df.drop_duplicates(subset="日付", keep="last").sort_values("日付").reset_index(drop=True)
+
+    traffic_df = dedup_by_date(traffic_df)
+    device_df = dedup_by_date(device_df)
+
+    latest_summary = summaries.get(latest_dl_date, {})
+
+    gaps = []
+    if not traffic_df.empty:
+        dates_sorted = sorted(traffic_df["日付"].unique())
+        for prev, cur in zip(dates_sorted, dates_sorted[1:]):
+            gap_days = (cur - prev).days
+            if gap_days > 1:
+                gaps.append((prev, cur, gap_days))
+
+    return {
+        "traffic": traffic_df,
+        "device": device_df,
+        "content": content_df,
+        "hourly": hourly_df,
+        "latest_dl_date": latest_dl_date,
+        "latest_summary": latest_summary,
+        "n_files": len(sources),
+        "gaps": gaps,
+        "file_warnings": file_warnings,
     }
 
 
@@ -1000,7 +1122,7 @@ CUSTOM_PERIOD_CHART_JS = """
 # ----------------------------------------------------------------------------
 # HTML組み立て
 # ----------------------------------------------------------------------------
-def build_html(data, out_path):
+def build_html(data, out_path=None):
     traffic_df, device_df, content_df = data["traffic"], data["device"], data["content"]
     latest_dl_date = data["latest_dl_date"]
     summary = data["latest_summary"]
@@ -1212,9 +1334,17 @@ function showPeriod(id) {{
 </body>
 </html>
 """
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(html)
-    print(f"ダッシュボードを出力しました: {out_path}")
+    if out_path is not None:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"ダッシュボードを出力しました: {out_path}")
+    return html
+
+
+def build_html_string(data):
+    """Streamlit（アップロード）版向け: ファイルに書き出さず、HTML文字列をそのまま返す。
+    dashboard_maker.py はこの戻り値を st.download_button の data として使う。"""
+    return build_html(data, out_path=None)
 
 
 def main():
