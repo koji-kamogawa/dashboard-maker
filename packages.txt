@@ -1,3 +1,0 @@
-fonts-ipafont-gothic
-fonts-ipaexfont-gothic
-fonts-takao
