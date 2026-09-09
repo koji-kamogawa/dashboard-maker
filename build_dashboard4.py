@@ -56,6 +56,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.font_manager as fm
+import japanize_matplotlib
 
 # ----------------------------------------------------------------------------
 # 日本語フォントの自動選択（無ければ警告を出して既定フォントで続行）
